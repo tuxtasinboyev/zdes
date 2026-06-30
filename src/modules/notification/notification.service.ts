@@ -1,0 +1,116 @@
+import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import type { Prisma } from '@prisma/client';
+import { PrismaService } from '../../common/congif/prisma/prisma.service';
+import { trimToNull } from '../../common/utils/helpers';
+import { CreateNotificationDto } from './dto/create-notification.dto';
+import { NotificationQueryDto } from './dto/notification-query.dto';
+import { UpdateNotificationDto } from './dto/update-notification.dto';
+
+@Injectable()
+export class NotificationService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async create(dto: CreateNotificationDto) {
+    const userId = dto.userId ? await this.ensureUserExists(dto.userId) : null;
+
+    return this.prisma.notification.create({
+      data: {
+        userId,
+        title: this.normalizeRequired(dto.title, 'Notification title is required'),
+        message: this.normalizeRequired(dto.message, 'Notification message is required'),
+        icon: dto.icon,
+        isRead: dto.isRead,
+      },
+    });
+  }
+
+  async findAll(query: NotificationQueryDto) {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 10;
+    const skip = (page - 1) * limit;
+    const search = trimToNull(query.search);
+
+    const where: Prisma.NotificationWhereInput = {
+      ...(query.userId ? { userId: query.userId } : {}),
+      ...(query.icon ? { icon: query.icon } : {}),
+      ...(query.isRead !== undefined ? { isRead: query.isRead } : {}),
+      ...(search
+        ? {
+            OR: [
+              { title: { contains: search, mode: 'insensitive' } },
+              { message: { contains: search, mode: 'insensitive' } },
+            ],
+          }
+        : {}),
+    };
+
+    const [items, total] = await this.prisma.$transaction([
+      this.prisma.notification.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+      }),
+      this.prisma.notification.count({ where }),
+    ]);
+
+    return { items, total, page, limit, totalPages: Math.max(1, Math.ceil(total / limit)) };
+  }
+
+  async findOne(id: string) {
+    return this.findNotificationByIdOrThrow(id);
+  }
+
+  async update(id: string, dto: UpdateNotificationDto) {
+    await this.findNotificationByIdOrThrow(id);
+    const userId = dto.userId !== undefined ? (dto.userId ? await this.ensureUserExists(dto.userId) : null) : undefined;
+
+    return this.prisma.notification.update({
+      where: { id },
+      data: {
+        ...(userId !== undefined ? { userId } : {}),
+        ...(dto.title !== undefined
+          ? { title: this.normalizeRequired(dto.title, 'Notification title is required') }
+          : {}),
+        ...(dto.message !== undefined
+          ? { message: this.normalizeRequired(dto.message, 'Notification message is required') }
+          : {}),
+        ...(dto.icon !== undefined ? { icon: dto.icon } : {}),
+        ...(dto.isRead !== undefined ? { isRead: dto.isRead } : {}),
+      },
+    });
+  }
+
+  async delete(id: string) {
+    await this.findNotificationByIdOrThrow(id);
+    await this.prisma.notification.delete({ where: { id } });
+    return { success: true as const, id };
+  }
+
+  private async findNotificationByIdOrThrow(id: string) {
+    const notification = await this.prisma.notification.findUnique({ where: { id } });
+    if (!notification) {
+      throw new NotFoundException('Notification not found');
+    }
+    return notification;
+  }
+
+  private async ensureUserExists(userId: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true },
+    });
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+    return user.id;
+  }
+
+  private normalizeRequired(value: string, message: string) {
+    const normalized = trimToNull(value);
+    if (!normalized) {
+      throw new ConflictException(message);
+    }
+    return normalized;
+  }
+}

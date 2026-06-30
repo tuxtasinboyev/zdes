@@ -1,0 +1,186 @@
+import {
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import type { Prisma } from '@prisma/client';
+import { PrismaService } from '../../common/congif/prisma/prisma.service';
+import { getMonthKey, trimToNull } from '../../common/utils/helpers';
+import type { AccessTokenPayload } from '../auth/interfaces/access-token-payload.interface';
+import { AdvanceQueryDto } from './dto/advance-query.dto';
+import { CreateAdvanceDto } from './dto/create-advance.dto';
+import { UpdateAdvanceDto } from './dto/update-advance.dto';
+
+@Injectable()
+export class AdvanceService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async create(dto: CreateAdvanceDto, actor: AccessTokenPayload) {
+    const companyId = await this.ensureCompanyExists(dto.companyId);
+    const employeeId = await this.ensureEmployeeBelongsToCompany(dto.employeeId, companyId);
+
+    const advanceDate = new Date(dto.date);
+    const month = this.resolveMonth(dto.month, advanceDate);
+
+    return this.prisma.advance.create({
+      data: {
+        companyId,
+        employeeId,
+        amount: dto.amount,
+        date: advanceDate,
+        month,
+        note: trimToNull(dto.note),
+        createdById: actor.sub,
+        updatedById: actor.sub,
+      },
+    });
+  }
+
+  async findAll(query: AdvanceQueryDto) {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 10;
+    const skip = (page - 1) * limit;
+
+    const where: Prisma.AdvanceWhereInput = {
+      ...(query.companyId ? { companyId: query.companyId } : {}),
+      ...(query.employeeId ? { employeeId: query.employeeId } : {}),
+      ...(trimToNull(query.month) ? { month: trimToNull(query.month) as string } : {}),
+      ...this.buildDateRangeFilter(query.dateFrom, query.dateTo),
+    };
+
+    const [items, total] = await this.prisma.$transaction([
+      this.prisma.advance.findMany({
+        where,
+        orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
+        skip,
+        take: limit,
+      }),
+      this.prisma.advance.count({ where }),
+    ]);
+
+    return {
+      items,
+      total,
+      page,
+      limit,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    };
+  }
+
+  async findOne(id: string) {
+    return this.findAdvanceByIdOrThrow(id);
+  }
+
+  async update(id: string, dto: UpdateAdvanceDto, actor: AccessTokenPayload) {
+    const existingAdvance = await this.findAdvanceByIdOrThrow(id);
+    const nextCompanyId =
+      dto.companyId !== undefined
+        ? await this.ensureCompanyExists(dto.companyId)
+        : existingAdvance.companyId;
+    const nextEmployeeId =
+      dto.employeeId !== undefined
+        ? await this.ensureEmployeeBelongsToCompany(dto.employeeId, nextCompanyId)
+        : await this.ensureEmployeeBelongsToCompany(existingAdvance.employeeId, nextCompanyId);
+    const nextDate = dto.date ? new Date(dto.date) : existingAdvance.date;
+    const nextMonth =
+      dto.month !== undefined
+        ? this.resolveMonth(dto.month, nextDate)
+        : dto.date
+          ? getMonthKey(nextDate)
+          : existingAdvance.month;
+
+    return this.prisma.advance.update({
+      where: { id },
+      data: {
+        companyId: nextCompanyId,
+        employeeId: nextEmployeeId,
+        ...(dto.amount !== undefined ? { amount: dto.amount } : {}),
+        ...(dto.date ? { date: nextDate } : {}),
+        month: nextMonth,
+        ...(dto.note !== undefined ? { note: trimToNull(dto.note) } : {}),
+        updatedById: actor.sub,
+      },
+    });
+  }
+
+  async delete(id: string) {
+    await this.findAdvanceByIdOrThrow(id);
+
+    await this.prisma.advance.delete({
+      where: { id },
+    });
+
+    return {
+      success: true as const,
+      id,
+    };
+  }
+
+  private async findAdvanceByIdOrThrow(id: string) {
+    const advance = await this.prisma.advance.findUnique({
+      where: { id },
+    });
+
+    if (!advance) {
+      throw new NotFoundException('Advance not found');
+    }
+
+    return advance;
+  }
+
+  private async ensureCompanyExists(companyId: string): Promise<string> {
+    const company = await this.prisma.company.findUnique({
+      where: { id: companyId },
+      select: { id: true },
+    });
+
+    if (!company) {
+      throw new NotFoundException('Company not found');
+    }
+
+    return company.id;
+  }
+
+  private async ensureEmployeeBelongsToCompany(
+    employeeId: string,
+    companyId: string,
+  ): Promise<string> {
+    const employee = await this.prisma.user.findUnique({
+      where: { id: employeeId },
+      select: {
+        id: true,
+        companyId: true,
+      },
+    });
+
+    if (!employee) {
+      throw new NotFoundException('Employee not found');
+    }
+
+    if (employee.companyId !== companyId) {
+      throw new ConflictException('Employee does not belong to the selected company');
+    }
+
+    return employee.id;
+  }
+
+  private resolveMonth(month: string | undefined, date: Date): string {
+    return trimToNull(month) ?? getMonthKey(date);
+  }
+
+  private buildDateRangeFilter(
+    dateFrom?: string,
+    dateTo?: string,
+  ): Prisma.AdvanceWhereInput {
+    if (!dateFrom && !dateTo) {
+      return {};
+    }
+
+    return {
+      date: {
+        ...(dateFrom ? { gte: new Date(dateFrom) } : {}),
+        ...(dateTo ? { lte: new Date(dateTo) } : {}),
+      },
+    };
+  }
+}

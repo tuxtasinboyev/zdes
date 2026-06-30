@@ -1,0 +1,615 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Company {
+  id        String    @id @default(uuid()) @db.Uuid
+  name      String    @unique @db.VarChar(255)
+  legalName String?   @db.VarChar(255)
+  phone     String?   @db.VarChar(50)
+  email     String?   @db.VarChar(255)
+  address   String?   @db.VarChar(500)
+  logoUrl   String?   @db.VarChar(500)
+  isActive  Boolean   @default(true)
+  stoppedAt DateTime? @db.Timestamptz(6)
+
+  users             User[]
+  branches          Branch[]
+  departments       Department[]
+  positions         Position[]
+  workSchedules     WorkSchedule[]
+  terminals         Terminal[]
+  holidays          Holiday[]
+  employeeLeaves    EmployeeLeave[]
+  attendances       Attendance[]
+  rawAttendanceLogs RawAttendanceLog[]
+  salaryAdjustments SalaryAdjustment[]
+  advances          Advance[]
+  payrolls          Payroll[]
+  settings          Setting[]
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@index([isActive])
+}
+
+model Branch {
+  id        String  @id @default(uuid()) @db.Uuid
+  companyId String  @db.Uuid
+  name      String  @db.VarChar(255)
+  address   String? @db.VarChar(500)
+  latitude  Float?
+  longitude Float?
+  radius    Int?    @default(100)
+  isActive  Boolean @default(true)
+
+  company        Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  users          User[]
+  departments    Department[]
+  workSchedules  WorkSchedule[]
+  terminals      Terminal[]
+  holidays       Holiday[]
+  employeeLeaves EmployeeLeave[]
+  attendances    Attendance[]
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@unique([companyId, name])
+  @@index([companyId])
+  @@index([isActive])
+}
+
+model Department {
+  id        String  @id @default(uuid()) @db.Uuid
+  companyId String  @db.Uuid
+  branchId  String? @db.Uuid
+  name      String  @db.VarChar(255)
+  isActive  Boolean @default(true)
+
+  company   Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  branch    Branch?    @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  users     User[]
+  positions Position[]
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@unique([companyId, branchId, name])
+  @@index([companyId])
+  @@index([branchId])
+  @@index([isActive])
+}
+
+model Position {
+  id           String  @id @default(uuid()) @db.Uuid
+  companyId    String  @db.Uuid
+  departmentId String? @db.Uuid
+  name         String  @db.VarChar(255)
+  isActive     Boolean @default(true)
+
+  company    Company     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  department Department? @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  users      User[]
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@unique([companyId, departmentId, name])
+  @@index([companyId])
+  @@index([departmentId])
+  @@index([isActive])
+}
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  login        String   @unique @db.VarChar(255)
+  passwordHash String   @db.VarChar(255)
+  role         UserRole @default(employee)
+
+  companyId      String? @db.Uuid
+  branchId       String? @db.Uuid
+  departmentId   String? @db.Uuid
+  positionId     String? @db.Uuid
+  managerId      String? @db.Uuid
+  workScheduleId String? @db.Uuid
+
+  employeeNo     String?   @db.VarChar(100)
+  firstName      String?   @db.VarChar(255)
+  lastName       String?   @db.VarChar(255)
+  middleName     String?   @db.VarChar(255)
+  phone          String?   @db.VarChar(50)
+  email          String?   @unique @db.VarChar(255)
+  address        String?   @db.VarChar(500)
+  passportSerial String?   @db.VarChar(100)
+  dateOfBirth    DateTime? @db.Date
+  avatarUrl      String?   @db.VarChar(500)
+
+  faceDeviceUserId String? @db.VarChar(100)
+  faceDescriptor   String?
+  faceImageUrl     String? @db.VarChar(500)
+
+  baseSalary Decimal? @db.Decimal(15, 2)
+
+  isActive  Boolean @default(true)
+  isBlocked Boolean @default(false)
+
+  company      Company?      @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  branch       Branch?       @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  department   Department?   @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  position     Position?     @relation(fields: [positionId], references: [id], onDelete: SetNull)
+  workSchedule WorkSchedule? @relation(fields: [workScheduleId], references: [id], onDelete: SetNull)
+
+  manager      User?  @relation("UserManager", fields: [managerId], references: [id], onDelete: SetNull)
+  subordinates User[] @relation("UserManager")
+
+  attendances       Attendance[]
+  rawAttendanceLogs RawAttendanceLog[]
+  salaryAdjustments SalaryAdjustment[]
+  advances          Advance[]
+  employeeLeaves    EmployeeLeave[]
+  payrolls          Payroll[]
+  notifications     Notification[]
+  refreshTokens     RefreshToken[]
+  pushTokens        PushToken[]
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@unique([companyId, employeeNo])
+  @@unique([companyId, faceDeviceUserId])
+  @@index([companyId])
+  @@index([branchId])
+  @@index([departmentId])
+  @@index([positionId])
+  @@index([managerId])
+  @@index([role])
+  @@index([isActive])
+}
+
+model WorkSchedule {
+  id        String  @id @default(uuid()) @db.Uuid
+  companyId String  @db.Uuid
+  branchId  String? @db.Uuid
+
+  name         String @db.VarChar(255)
+  startTime    String @db.VarChar(10)
+  endTime      String @db.VarChar(10)
+  workDays     Json   @db.Json
+  graceMinutes Int    @default(0)
+
+  isDefault Boolean @default(false)
+  isActive  Boolean @default(true)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  branch  Branch? @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  users   User[]
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@unique([companyId, name])
+  @@index([companyId])
+  @@index([branchId])
+  @@index([isDefault])
+  @@index([isActive])
+}
+
+model Terminal {
+  id        String  @id @default(uuid()) @db.Uuid
+  companyId String  @db.Uuid
+  branchId  String? @db.Uuid
+
+  name         String         @db.VarChar(255)
+  serialNumber String         @unique @db.VarChar(255)
+  ipAddress    String?        @db.VarChar(100)
+  port         Int?
+  type         TerminalType   @default(zkteco_face)
+  status       TerminalStatus @default(active)
+
+  connectionConfig Json?     @db.Json
+  lastSyncAt       DateTime? @db.Timestamptz(6)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  branch  Branch? @relation(fields: [branchId], references: [id], onDelete: SetNull)
+
+  attendances       Attendance[]
+  rawAttendanceLogs RawAttendanceLog[]
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@index([companyId])
+  @@index([branchId])
+  @@index([status])
+}
+
+model Attendance {
+  id         String  @id @default(uuid()) @db.Uuid
+  companyId  String  @db.Uuid
+  branchId   String? @db.Uuid
+  employeeId String  @db.Uuid
+  terminalId String? @db.Uuid
+
+  date     DateTime  @db.Date
+  checkIn  DateTime? @db.Timestamptz(6)
+  checkOut DateTime? @db.Timestamptz(6)
+
+  status AttendanceStatus @default(present)
+  source AttendanceSource @default(terminal)
+
+  workStartTime String? @db.VarChar(10)
+  workEndTime   String? @db.VarChar(10)
+
+  workedMinutes     Int @default(0)
+  lateMinutes       Int @default(0)
+  earlyLeaveMinutes Int @default(0)
+  overtimeMinutes   Int @default(0)
+
+  checkInImageUrl  String? @db.VarChar(500)
+  checkOutImageUrl String? @db.VarChar(500)
+  notes            String?
+
+  company  Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  branch   Branch?   @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  employee User      @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  terminal Terminal? @relation(fields: [terminalId], references: [id], onDelete: SetNull)
+
+  rawLogs RawAttendanceLog[]
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@unique([employeeId, date])
+  @@index([companyId])
+  @@index([branchId])
+  @@index([employeeId])
+  @@index([terminalId])
+  @@index([date])
+  @@index([status])
+}
+
+model RawAttendanceLog {
+  id           String  @id @default(uuid()) @db.Uuid
+  companyId    String  @db.Uuid
+  terminalId   String  @db.Uuid
+  employeeId   String? @db.Uuid
+  attendanceId String? @db.Uuid
+
+  deviceUserId String            @db.VarChar(100)
+  eventTime    DateTime          @db.Timestamptz(6)
+  eventType    TerminalEventType @default(unknown)
+
+  rawPayload Json?   @db.Json
+  processed  Boolean @default(false)
+  error      String?
+
+  company    Company     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  terminal   Terminal    @relation(fields: [terminalId], references: [id], onDelete: Cascade)
+  employee   User?       @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+  attendance Attendance? @relation(fields: [attendanceId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@unique([terminalId, eventTime, deviceUserId, eventType])
+  @@index([companyId])
+  @@index([terminalId])
+  @@index([employeeId])
+  @@index([attendanceId])
+  @@index([eventTime])
+  @@index([processed])
+}
+
+model SalaryAdjustment {
+  id         String @id @default(uuid()) @db.Uuid
+  companyId  String @db.Uuid
+  employeeId String @db.Uuid
+
+  type     AdjustmentType
+  category AdjustmentCategory @default(manual)
+
+  amount Decimal  @db.Decimal(15, 2)
+  date   DateTime @db.Date
+  month  String   @db.VarChar(7)
+
+  reason      String?
+  createdById String? @db.Uuid
+  updatedById String? @db.Uuid
+
+  company  Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  employee User    @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@index([companyId])
+  @@index([employeeId])
+  @@index([month])
+  @@index([type])
+  @@index([category])
+}
+
+model Advance {
+  id         String @id @default(uuid()) @db.Uuid
+  companyId  String @db.Uuid
+  employeeId String @db.Uuid
+
+  amount Decimal  @db.Decimal(15, 2)
+  date   DateTime @db.Date
+  month  String   @db.VarChar(7)
+
+  note        String?
+  createdById String? @db.Uuid
+  updatedById String? @db.Uuid
+
+  company  Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  employee User    @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@index([companyId])
+  @@index([employeeId])
+  @@index([month])
+  @@index([date])
+}
+
+model Holiday {
+  id        String  @id @default(uuid()) @db.Uuid
+  companyId String  @db.Uuid
+  branchId  String? @db.Uuid
+
+  name      String   @db.VarChar(255)
+  startDate DateTime @db.Date
+  endDate   DateTime @db.Date
+
+  affectsSalary Boolean @default(false)
+  note          String?
+  createdById   String? @db.Uuid
+  updatedById   String? @db.Uuid
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  branch  Branch? @relation(fields: [branchId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@index([companyId])
+  @@index([branchId])
+  @@index([startDate])
+  @@index([endDate])
+}
+
+model EmployeeLeave  {
+  id         String  @id @default(uuid()) @db.Uuid
+  companyId  String  @db.Uuid
+  branchId   String? @db.Uuid
+  employeeId String  @db.Uuid
+
+  type     LeaveType @default(vacation)
+  fromDate DateTime  @db.Date
+  toDate   DateTime  @db.Date
+  days     Int
+
+  affectsSalary Boolean @default(false)
+  reason        String?
+  createdById   String? @db.Uuid
+  updatedById   String? @db.Uuid
+
+  company  Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  branch   Branch? @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  employee User    @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@index([companyId])
+  @@index([branchId])
+  @@index([employeeId])
+  @@index([fromDate])
+  @@index([toDate])
+}
+
+model Payroll {
+  id         String @id @default(uuid()) @db.Uuid
+  companyId  String @db.Uuid
+  employeeId String @db.Uuid
+
+  month String @db.VarChar(7)
+
+  baseSalary   Decimal @default(0) @db.Decimal(15, 2)
+  totalBonus   Decimal @default(0) @db.Decimal(15, 2)
+  totalPenalty Decimal @default(0) @db.Decimal(15, 2)
+  totalAdvance Decimal @default(0) @db.Decimal(15, 2)
+  netSalary    Decimal @default(0) @db.Decimal(15, 2)
+
+  status PayrollStatus @default(draft)
+
+  paidAt   DateTime? @db.Timestamptz(6)
+  paidById String?   @db.Uuid
+
+  createdById String? @db.Uuid
+  updatedById String? @db.Uuid
+
+  company  Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  employee User    @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@unique([employeeId, month])
+  @@index([companyId])
+  @@index([employeeId])
+  @@index([month])
+  @@index([status])
+}
+
+model Setting {
+  id        String @id @default(uuid()) @db.Uuid
+  companyId String @db.Uuid
+
+  key   String @db.VarChar(255)
+  value Json?  @db.Json
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@unique([companyId, key])
+  @@index([companyId])
+}
+
+model Notification {
+  id     String  @id @default(uuid()) @db.Uuid
+  userId String? @db.Uuid
+
+  title   String            @db.VarChar(255)
+  message String
+  icon    NotificationIcon?
+  isRead  Boolean           @default(false)
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@index([userId])
+  @@index([isRead])
+}
+
+model PushToken {
+  id     String @id @default(uuid()) @db.Uuid
+  userId String @db.Uuid
+
+  token      String    @unique
+  platform   String?   @db.VarChar(50)
+  deviceId   String?   @db.VarChar(255)
+  deviceName String?   @db.VarChar(255)
+  lastSeenAt DateTime? @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@index([userId])
+}
+
+model RefreshToken {
+  id     String @id @default(uuid()) @db.Uuid
+  userId String @db.Uuid
+
+  token      String
+  expiresAt  DateTime  @db.Timestamptz(6)
+  deviceType String?   @db.VarChar(100)
+  deviceName String?   @db.VarChar(255)
+  userAgent  String?
+  ipAddress  String?   @db.VarChar(100)
+  lastUsedAt DateTime? @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model AppVersion {
+  id      String @id @default(uuid()) @db.Uuid
+  android Json?  @db.Json
+  ios     Json?  @db.Json
+
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+}
+
+enum UserRole {
+  superadmin
+  admin
+  manager
+  employee
+}
+
+enum TerminalType {
+  zkteco_face
+  turnstile
+  face_id
+  fingerprint
+  other
+}
+
+enum TerminalStatus {
+  active
+  inactive
+  error
+}
+
+enum TerminalEventType {
+  check_in
+  check_out
+  unknown
+}
+
+enum AttendanceSource {
+  terminal
+  manual
+  import
+}
+
+enum AttendanceStatus {
+  present
+  late
+  absent
+  early_leave
+  holiday
+  leave
+}
+
+enum AdjustmentType {
+  bonus
+  penalty
+}
+
+enum AdjustmentCategory {
+  late
+  early_leave
+  absent
+  overtime
+  holiday_bonus
+  manual
+  other
+}
+
+enum LeaveType {
+  vacation
+  sick
+  unpaid
+  business_trip
+  other
+}
+
+enum PayrollStatus {
+  draft
+  confirmed
+  paid
+  cancelled
+}
+
+enum NotificationIcon {
+  user
+  briefcase
+  lock
+  alert
+  money
+  attendance
+}

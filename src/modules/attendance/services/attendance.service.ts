@@ -1,0 +1,733 @@
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import {
+  AdjustmentCategory,
+  AdjustmentType,
+  AttendanceSource,
+  AttendanceStatus,
+  Prisma,
+} from '@prisma/client';
+import type {
+  Attendance,
+  SalaryAdjustment,
+  User,
+  WorkSchedule,
+} from '@prisma/client';
+import { PrismaService } from '../../../common/congif/prisma/prisma.service';
+import {
+  calculateMinutesDifference,
+  decodeBase64Image,
+  getMonthKey,
+  getWorkDayNumber,
+  parseTimeToUtcDate,
+  toUtcDateOnly,
+  trimToNull,
+} from '../../../common/utils/helpers';
+import { AccessTokenPayload } from '../../auth/interfaces/access-token-payload.interface';
+import {
+  ATTENDANCE_KPI_SETTING_KEY,
+  AUTO_ATTENDANCE_REASON_PREFIX,
+  DEFAULT_ATTENDANCE_KPI_TEMPLATE,
+} from '../constants/attendance.constants';
+import { AttendanceAdjustmentDto } from '../dto/attendance-adjustment.dto';
+import { AttendanceCheckInDto } from '../dto/attendance-check-in.dto';
+import { AttendanceCheckOutDto } from '../dto/attendance-check-out.dto';
+import { AttendanceKpiTemplateDto } from '../dto/attendance-kpi-template.dto';
+import { AttendanceQueryDto } from '../dto/attendance-query.dto';
+import { AwsFaceVerificationService } from './aws-face-verification.service';
+import { AwsS3Service } from './aws-s3.service';
+
+type AttendanceKpiTemplate = Required<
+  Omit<AttendanceKpiTemplateDto, 'companyId'>
+> & { companyId: string };
+
+type UserWithSchedule = User & {
+  workSchedule: WorkSchedule | null;
+};
+
+type AttendanceMetrics = {
+  workStartTime: string | null;
+  workEndTime: string | null;
+  workedMinutes: number;
+  lateMinutes: number;
+  earlyLeaveMinutes: number;
+  overtimeMinutes: number;
+  status: AttendanceStatus;
+};
+
+@Injectable()
+export class AttendanceService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly awsS3Service: AwsS3Service,
+    private readonly awsFaceVerificationService: AwsFaceVerificationService,
+  ) {}
+
+  async getKpiTemplate(companyId: string): Promise<AttendanceKpiTemplateDto> {
+    return this.getKpiTemplateOrDefault(companyId);
+  }
+
+  async upsertKpiTemplate(dto: AttendanceKpiTemplateDto): Promise<AttendanceKpiTemplateDto> {
+    await this.ensureCompanyExists(dto.companyId);
+
+    const template = this.normalizeKpiTemplate(dto);
+
+    await this.prisma.setting.upsert({
+      where: {
+        companyId_key: {
+          companyId: dto.companyId,
+          key: ATTENDANCE_KPI_SETTING_KEY,
+        },
+      },
+      update: {
+        value: template,
+      },
+      create: {
+        companyId: dto.companyId,
+        key: ATTENDANCE_KPI_SETTING_KEY,
+        value: template,
+      },
+    });
+
+    return {
+      companyId: dto.companyId,
+      ...template,
+    };
+  }
+
+  async checkIn(
+    dto: AttendanceCheckInDto,
+    actor: AccessTokenPayload,
+  ) {
+    const eventTime = this.parseEventTime(dto.eventTime);
+    const employee = await this.findEmployeeOrThrow(dto.employeeId);
+    const template = await this.getKpiTemplateOrDefault(employee.companyId as string);
+    const terminalId = await this.ensureTerminalBelongsToCompany(
+      dto.terminalId,
+      employee.companyId as string,
+    );
+
+    const { imageUrl, similarity } = await this.verifyAndUploadAttendanceImage({
+      employee,
+      eventType: 'check-in',
+      imageBase64: dto.imageBase64,
+      contentType: dto.contentType,
+      similarityThreshold: template.faceSimilarityThreshold,
+    });
+
+    const attendanceDate = toUtcDateOnly(eventTime);
+    const existingAttendance = await this.prisma.attendance.findUnique({
+      where: {
+        employeeId_date: {
+          employeeId: employee.id,
+          date: attendanceDate,
+        },
+      },
+    });
+
+    if (existingAttendance?.checkIn) {
+      throw new ConflictException('Employee already checked in for this date');
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      const metrics = this.calculateAttendanceMetrics(
+        employee.workSchedule,
+        attendanceDate,
+        eventTime,
+        existingAttendance?.checkOut ?? null,
+      );
+
+      const attendance = existingAttendance
+        ? await tx.attendance.update({
+            where: { id: existingAttendance.id },
+            data: {
+              terminalId: terminalId ?? existingAttendance.terminalId,
+              checkIn: eventTime,
+              status: metrics.status,
+              source: AttendanceSource.manual,
+              workStartTime: metrics.workStartTime,
+              workEndTime: metrics.workEndTime,
+              workedMinutes: metrics.workedMinutes,
+              lateMinutes: metrics.lateMinutes,
+              earlyLeaveMinutes: metrics.earlyLeaveMinutes,
+              overtimeMinutes: metrics.overtimeMinutes,
+              checkInImageUrl: imageUrl,
+              notes: this.mergeNotes(existingAttendance.notes, dto.notes),
+            },
+          })
+        : await tx.attendance.create({
+            data: {
+              companyId: employee.companyId as string,
+              branchId: employee.branchId,
+              employeeId: employee.id,
+              terminalId,
+              date: attendanceDate,
+              checkIn: eventTime,
+              status: metrics.status,
+              source: AttendanceSource.manual,
+              workStartTime: metrics.workStartTime,
+              workEndTime: metrics.workEndTime,
+              workedMinutes: metrics.workedMinutes,
+              lateMinutes: metrics.lateMinutes,
+              earlyLeaveMinutes: metrics.earlyLeaveMinutes,
+              overtimeMinutes: metrics.overtimeMinutes,
+              checkInImageUrl: imageUrl,
+              notes: this.mergeNotes(null, dto.notes),
+            },
+          });
+
+      const adjustments = await this.syncAttendanceAdjustments(
+        tx,
+        attendance,
+        template,
+        actor.sub,
+      );
+
+      return this.toResponse(attendance, adjustments, similarity);
+    });
+  }
+
+  async checkOut(
+    dto: AttendanceCheckOutDto,
+    actor: AccessTokenPayload,
+  ) {
+    const eventTime = this.parseEventTime(dto.eventTime);
+    const employee = await this.findEmployeeOrThrow(dto.employeeId);
+    const template = await this.getKpiTemplateOrDefault(employee.companyId as string);
+    const terminalId = await this.ensureTerminalBelongsToCompany(
+      dto.terminalId,
+      employee.companyId as string,
+    );
+
+    const { imageUrl, similarity } = await this.verifyAndUploadAttendanceImage({
+      employee,
+      eventType: 'check-out',
+      imageBase64: dto.imageBase64,
+      contentType: dto.contentType,
+      similarityThreshold: template.faceSimilarityThreshold,
+    });
+
+    const attendanceDate = toUtcDateOnly(eventTime);
+    const existingAttendance = await this.prisma.attendance.findUnique({
+      where: {
+        employeeId_date: {
+          employeeId: employee.id,
+          date: attendanceDate,
+        },
+      },
+    });
+
+    if (!existingAttendance?.checkIn) {
+      throw new ConflictException('Employee must check in before check out');
+    }
+
+    if (existingAttendance.checkOut) {
+      throw new ConflictException('Employee already checked out for this date');
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      const metrics = this.calculateAttendanceMetrics(
+        employee.workSchedule,
+        attendanceDate,
+        existingAttendance.checkIn,
+        eventTime,
+      );
+
+      const attendance = await tx.attendance.update({
+        where: { id: existingAttendance.id },
+        data: {
+          terminalId: terminalId ?? existingAttendance.terminalId,
+          checkOut: eventTime,
+          status: metrics.status,
+          source: AttendanceSource.manual,
+          workStartTime: metrics.workStartTime,
+          workEndTime: metrics.workEndTime,
+          workedMinutes: metrics.workedMinutes,
+          lateMinutes: metrics.lateMinutes,
+          earlyLeaveMinutes: metrics.earlyLeaveMinutes,
+          overtimeMinutes: metrics.overtimeMinutes,
+          checkOutImageUrl: imageUrl,
+          notes: this.mergeNotes(existingAttendance.notes, dto.notes),
+        },
+      });
+
+      const adjustments = await this.syncAttendanceAdjustments(
+        tx,
+        attendance,
+        template,
+        actor.sub,
+      );
+
+      return this.toResponse(attendance, adjustments, similarity);
+    });
+  }
+
+  async findAll(query: AttendanceQueryDto) {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 10;
+    const skip = (page - 1) * limit;
+
+    const where: Prisma.AttendanceWhereInput = {
+      ...(query.companyId ? { companyId: query.companyId } : {}),
+      ...(query.branchId ? { branchId: query.branchId } : {}),
+      ...(query.employeeId ? { employeeId: query.employeeId } : {}),
+      ...(query.terminalId ? { terminalId: query.terminalId } : {}),
+      ...(query.status ? { status: query.status } : {}),
+      ...this.buildDateRangeFilter(query.dateFrom, query.dateTo),
+    };
+
+    const [items, total] = await this.prisma.$transaction([
+      this.prisma.attendance.findMany({
+        where,
+        orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
+        skip,
+        take: limit,
+      }),
+      this.prisma.attendance.count({ where }),
+    ]);
+
+    const responses = await Promise.all(
+      items.map(async (item) => this.toResponse(item, await this.loadAdjustmentsForAttendance(item))),
+    );
+
+    return {
+      items: responses,
+      total,
+      page,
+      limit,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    };
+  }
+
+  async findOne(id: string) {
+    const attendance = await this.prisma.attendance.findUnique({
+      where: { id },
+    });
+
+    if (!attendance) {
+      throw new NotFoundException('Attendance not found');
+    }
+
+    return this.toResponse(attendance, await this.loadAdjustmentsForAttendance(attendance));
+  }
+
+  private async verifyAndUploadAttendanceImage(input: {
+    employee: UserWithSchedule;
+    eventType: 'check-in' | 'check-out';
+    imageBase64: string;
+    contentType?: string;
+    similarityThreshold: number;
+  }): Promise<{ imageUrl: string; similarity: number }> {
+    const referenceImageUrl = trimToNull(input.employee.faceImageUrl);
+
+    if (!referenceImageUrl) {
+      throw new ConflictException('Employee does not have a reference face image');
+    }
+
+    const { buffer, contentType: decodedContentType } = decodeBase64Image(input.imageBase64);
+
+    if (!buffer.length) {
+      throw new BadRequestException('Attendance image is empty');
+    }
+
+    const contentType = trimToNull(input.contentType) ?? decodedContentType ?? 'image/jpeg';
+
+    const similarity = await this.awsFaceVerificationService.verifyAttendanceFace({
+      sourceImageBuffer: buffer,
+      referenceImageUrl,
+      similarityThreshold: input.similarityThreshold,
+    });
+
+    const uploadedImage = await this.awsS3Service.uploadAttendanceImage({
+      companyId: input.employee.companyId as string,
+      employeeId: input.employee.id,
+      eventType: input.eventType,
+      contentType,
+      imageBuffer: buffer,
+    });
+
+    return {
+      imageUrl: uploadedImage.url,
+      similarity,
+    };
+  }
+
+  private calculateAttendanceMetrics(
+    workSchedule: WorkSchedule | null,
+    attendanceDate: Date,
+    checkIn: Date | null,
+    checkOut: Date | null,
+  ): AttendanceMetrics {
+    const workedMinutes = calculateMinutesDifference(checkIn, checkOut);
+
+    if (!workSchedule?.isActive) {
+      return {
+        workStartTime: null,
+        workEndTime: null,
+        workedMinutes,
+        lateMinutes: 0,
+        earlyLeaveMinutes: 0,
+        overtimeMinutes: 0,
+        status: this.resolveAttendanceStatus(0, 0, checkIn, checkOut),
+      };
+    }
+
+    const workDays = this.extractWorkDays(workSchedule.workDays);
+
+    if (!workDays.includes(getWorkDayNumber(attendanceDate))) {
+      return {
+        workStartTime: workSchedule.startTime,
+        workEndTime: workSchedule.endTime,
+        workedMinutes,
+        lateMinutes: 0,
+        earlyLeaveMinutes: 0,
+        overtimeMinutes: 0,
+        status: this.resolveAttendanceStatus(0, 0, checkIn, checkOut),
+      };
+    }
+
+    const scheduledStart = parseTimeToUtcDate(attendanceDate, workSchedule.startTime);
+    const scheduledEnd = parseTimeToUtcDate(attendanceDate, workSchedule.endTime);
+    const graceMinutes = workSchedule.graceMinutes ?? 0;
+
+    const lateMinutes = checkIn
+      ? Math.max(0, calculateMinutesDifference(scheduledStart, checkIn) - graceMinutes)
+      : 0;
+    const earlyLeaveMinutes =
+      checkOut && checkOut.getTime() < scheduledEnd.getTime()
+        ? calculateMinutesDifference(checkOut, scheduledEnd)
+        : 0;
+    const overtimeMinutes =
+      checkOut && checkOut.getTime() > scheduledEnd.getTime()
+        ? calculateMinutesDifference(scheduledEnd, checkOut)
+        : 0;
+
+    return {
+      workStartTime: workSchedule.startTime,
+      workEndTime: workSchedule.endTime,
+      workedMinutes,
+      lateMinutes,
+      earlyLeaveMinutes,
+      overtimeMinutes,
+      status: this.resolveAttendanceStatus(lateMinutes, earlyLeaveMinutes, checkIn, checkOut),
+    };
+  }
+
+  private resolveAttendanceStatus(
+    lateMinutes: number,
+    earlyLeaveMinutes: number,
+    checkIn: Date | null,
+    checkOut: Date | null,
+  ): AttendanceStatus {
+    if (!checkIn && !checkOut) {
+      return AttendanceStatus.absent;
+    }
+
+    if (lateMinutes > 0) {
+      return AttendanceStatus.late;
+    }
+
+    if (earlyLeaveMinutes > 0) {
+      return AttendanceStatus.early_leave;
+    }
+
+    return AttendanceStatus.present;
+  }
+
+  private async syncAttendanceAdjustments(
+    tx: Prisma.TransactionClient,
+    attendance: Attendance,
+    template: AttendanceKpiTemplate,
+    actorId: string,
+  ): Promise<AttendanceAdjustmentDto[]> {
+    const reasonPrefix = `${AUTO_ATTENDANCE_REASON_PREFIX}:${attendance.id}:`;
+
+    await tx.salaryAdjustment.deleteMany({
+      where: {
+        companyId: attendance.companyId,
+        employeeId: attendance.employeeId,
+        date: attendance.date,
+        reason: {
+          startsWith: reasonPrefix,
+        },
+      },
+    });
+
+    const adjustmentPayloads = [
+      {
+        shouldCreate: attendance.lateMinutes > 0 && template.latePenaltyPerMinute > 0,
+        type: AdjustmentType.penalty,
+        category: AdjustmentCategory.late,
+        amount: attendance.lateMinutes * template.latePenaltyPerMinute,
+        reason: `${reasonPrefix}late`,
+      },
+      {
+        shouldCreate:
+          attendance.earlyLeaveMinutes > 0 && template.earlyLeavePenaltyPerMinute > 0,
+        type: AdjustmentType.penalty,
+        category: AdjustmentCategory.early_leave,
+        amount: attendance.earlyLeaveMinutes * template.earlyLeavePenaltyPerMinute,
+        reason: `${reasonPrefix}early_leave`,
+      },
+      {
+        shouldCreate: attendance.overtimeMinutes > 0 && template.overtimeBonusPerMinute > 0,
+        type: AdjustmentType.bonus,
+        category: AdjustmentCategory.overtime,
+        amount: attendance.overtimeMinutes * template.overtimeBonusPerMinute,
+        reason: `${reasonPrefix}overtime`,
+      },
+    ].filter((item) => item.shouldCreate);
+
+    const createdAdjustments = await Promise.all(
+      adjustmentPayloads.map((item) =>
+        tx.salaryAdjustment.create({
+          data: {
+            companyId: attendance.companyId,
+            employeeId: attendance.employeeId,
+            type: item.type,
+            category: item.category,
+            amount: item.amount,
+            date: attendance.date,
+            month: getMonthKey(attendance.date),
+            reason: item.reason,
+            createdById: actorId,
+            updatedById: actorId,
+          },
+        }),
+      ),
+    );
+
+    return createdAdjustments.map((item) => this.toAdjustmentDto(item));
+  }
+
+  private async loadAdjustmentsForAttendance(
+    attendance: Attendance,
+  ): Promise<AttendanceAdjustmentDto[]> {
+    const adjustments = await this.prisma.salaryAdjustment.findMany({
+      where: {
+        companyId: attendance.companyId,
+        employeeId: attendance.employeeId,
+        date: attendance.date,
+        reason: {
+          startsWith: `${AUTO_ATTENDANCE_REASON_PREFIX}:${attendance.id}:`,
+        },
+      },
+      orderBy: {
+        createdAt: 'asc',
+      },
+    });
+
+    return adjustments.map((item) => this.toAdjustmentDto(item));
+  }
+
+  private toAdjustmentDto(item: SalaryAdjustment): AttendanceAdjustmentDto {
+    return {
+      id: item.id,
+      type: item.type,
+      category: item.category,
+      amount: Number(item.amount),
+      date: item.date,
+      month: item.month,
+      reason: item.reason,
+    };
+  }
+
+  private toResponse(
+    attendance: Attendance,
+    appliedAdjustments: AttendanceAdjustmentDto[],
+    faceSimilarity?: number,
+  ) {
+    return {
+      id: attendance.id,
+      companyId: attendance.companyId,
+      branchId: attendance.branchId,
+      employeeId: attendance.employeeId,
+      terminalId: attendance.terminalId,
+      date: attendance.date,
+      checkIn: attendance.checkIn,
+      checkOut: attendance.checkOut,
+      status: attendance.status,
+      source: attendance.source,
+      workStartTime: attendance.workStartTime,
+      workEndTime: attendance.workEndTime,
+      workedMinutes: attendance.workedMinutes,
+      lateMinutes: attendance.lateMinutes,
+      earlyLeaveMinutes: attendance.earlyLeaveMinutes,
+      overtimeMinutes: attendance.overtimeMinutes,
+      checkInImageUrl: attendance.checkInImageUrl,
+      checkOutImageUrl: attendance.checkOutImageUrl,
+      notes: attendance.notes,
+      faceSimilarity,
+      appliedAdjustments,
+      createdAt: attendance.createdAt,
+      updatedAt: attendance.updatedAt,
+    };
+  }
+
+  private async findEmployeeOrThrow(employeeId: string): Promise<UserWithSchedule> {
+    const employee = await this.prisma.user.findUnique({
+      where: { id: employeeId },
+      include: {
+        workSchedule: true,
+      },
+    });
+
+    if (!employee) {
+      throw new NotFoundException('Employee not found');
+    }
+
+    if (!employee.companyId) {
+      throw new ConflictException('Employee is not assigned to a company');
+    }
+
+    if (!employee.isActive || employee.isBlocked) {
+      throw new ForbiddenException('Employee is inactive or blocked');
+    }
+
+    return employee;
+  }
+
+  private async ensureTerminalBelongsToCompany(
+    terminalId: string | undefined,
+    companyId: string,
+  ): Promise<string | null> {
+    if (!terminalId) {
+      return null;
+    }
+
+    const terminal = await this.prisma.terminal.findUnique({
+      where: { id: terminalId },
+      select: { id: true, companyId: true },
+    });
+
+    if (!terminal) {
+      throw new NotFoundException('Terminal not found');
+    }
+
+    if (terminal.companyId !== companyId) {
+      throw new ConflictException('Terminal does not belong to the selected company');
+    }
+
+    return terminal.id;
+  }
+
+  private async ensureCompanyExists(companyId: string): Promise<void> {
+    const company = await this.prisma.company.findUnique({
+      where: { id: companyId },
+      select: { id: true },
+    });
+
+    if (!company) {
+      throw new NotFoundException('Company not found');
+    }
+  }
+
+  private async getKpiTemplateOrDefault(companyId: string): Promise<AttendanceKpiTemplate> {
+    await this.ensureCompanyExists(companyId);
+
+    const setting = await this.prisma.setting.findUnique({
+      where: {
+        companyId_key: {
+          companyId,
+          key: ATTENDANCE_KPI_SETTING_KEY,
+        },
+      },
+    });
+
+    const value =
+      setting?.value && typeof setting.value === 'object' && !Array.isArray(setting.value)
+        ? (setting.value as Record<string, unknown>)
+        : {};
+
+    return {
+      companyId,
+      latePenaltyPerMinute: this.toNonNegativeNumber(
+        value.latePenaltyPerMinute,
+        DEFAULT_ATTENDANCE_KPI_TEMPLATE.latePenaltyPerMinute,
+      ),
+      earlyLeavePenaltyPerMinute: this.toNonNegativeNumber(
+        value.earlyLeavePenaltyPerMinute,
+        DEFAULT_ATTENDANCE_KPI_TEMPLATE.earlyLeavePenaltyPerMinute,
+      ),
+      overtimeBonusPerMinute: this.toNonNegativeNumber(
+        value.overtimeBonusPerMinute,
+        DEFAULT_ATTENDANCE_KPI_TEMPLATE.overtimeBonusPerMinute,
+      ),
+      faceSimilarityThreshold: this.toNonNegativeNumber(
+        value.faceSimilarityThreshold,
+        DEFAULT_ATTENDANCE_KPI_TEMPLATE.faceSimilarityThreshold,
+      ),
+    };
+  }
+
+  private normalizeKpiTemplate(dto: AttendanceKpiTemplateDto): Omit<AttendanceKpiTemplate, 'companyId'> {
+    return {
+      latePenaltyPerMinute: dto.latePenaltyPerMinute ?? DEFAULT_ATTENDANCE_KPI_TEMPLATE.latePenaltyPerMinute,
+      earlyLeavePenaltyPerMinute:
+        dto.earlyLeavePenaltyPerMinute ??
+        DEFAULT_ATTENDANCE_KPI_TEMPLATE.earlyLeavePenaltyPerMinute,
+      overtimeBonusPerMinute:
+        dto.overtimeBonusPerMinute ?? DEFAULT_ATTENDANCE_KPI_TEMPLATE.overtimeBonusPerMinute,
+      faceSimilarityThreshold:
+        dto.faceSimilarityThreshold ?? DEFAULT_ATTENDANCE_KPI_TEMPLATE.faceSimilarityThreshold,
+    };
+  }
+
+  private toNonNegativeNumber(value: unknown, fallback: number): number {
+    if (typeof value !== 'number' || Number.isNaN(value) || value < 0) {
+      return fallback;
+    }
+
+    return value;
+  }
+
+  private parseEventTime(value?: string): Date {
+    const eventTime = value ? new Date(value) : new Date();
+
+    if (Number.isNaN(eventTime.getTime())) {
+      throw new BadRequestException('eventTime must be a valid ISO date string');
+    }
+
+    return eventTime;
+  }
+
+  private extractWorkDays(value: Prisma.JsonValue): number[] {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+
+    return value.filter((item): item is number => typeof item === 'number');
+  }
+
+  private buildDateRangeFilter(dateFrom?: string, dateTo?: string): Prisma.AttendanceWhereInput {
+    if (!dateFrom && !dateTo) {
+      return {};
+    }
+
+    return {
+      date: {
+        ...(dateFrom ? { gte: new Date(dateFrom) } : {}),
+        ...(dateTo ? { lte: new Date(dateTo) } : {}),
+      },
+    };
+  }
+
+  private mergeNotes(existingNotes: string | null, incomingNotes?: string): string | null {
+    const normalizedIncomingNotes = trimToNull(incomingNotes);
+
+    if (!existingNotes) {
+      return normalizedIncomingNotes;
+    }
+
+    if (!normalizedIncomingNotes) {
+      return existingNotes;
+    }
+
+    return `${existingNotes}\n${normalizedIncomingNotes}`;
+  }
+}
